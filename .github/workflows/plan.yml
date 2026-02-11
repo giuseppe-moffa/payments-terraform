@@ -1,7 +1,6 @@
 name: Terraform Plan
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       request_id:
@@ -10,12 +9,15 @@ on:
         type: string
       environment:
         description: "Environment (dev or prod)"
-        required: false
-        default: dev
+        required: true
         type: choice
         options:
           - dev
           - prod
+
+concurrency:
+  group: payments-terraform-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
@@ -43,12 +45,36 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      - name: Debug AWS identity and context
+        run: |
+          set -euxo pipefail
+          aws sts get-caller-identity
+          aws configure get region || true
+          echo "TF_WORKING_DIR=$(pwd)"
+          terraform version
+          pwd
+          ls -la
+
       - name: Terraform Init
-        run: terraform init -input=false
+        run: |
+          set -euxo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=tfpilot-tfstate-core-${{ env.ENVIRONMENT }}" \
+            -backend-config="key=tfpilot-tfstate-core-${{ env.ENVIRONMENT }}/envs/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+            -backend-config="region=eu-west-2" \
+            -backend-config="dynamodb_table=tfpilot-tfstate-lock-core-${{ env.ENVIRONMENT }}" \
+            -backend-config="encrypt=true"
 
       - name: Terraform Plan
-        run: terraform plan -input=false -no-color | tee plan.out
+        run: |
+          set -euxo pipefail
+          terraform plan -input=false -no-color -lock-timeout=300s | tee plan.txt
 
-      - name: Upload plan summary
+      - name: Upload plan logs
         if: always()
-        run: cat plan.out
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-logs
+          path: |
+            plan.txt
+            envs/${{ inputs.environment }}/.terraform.lock.hcl

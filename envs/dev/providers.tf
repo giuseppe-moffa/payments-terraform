@@ -3,9 +3,9 @@ provider "aws" {
 
   default_tags {
     tags = {
-      project     = "payments"
-      environment = "dev"
-      managed_by  = "tfpilot"
+      ManagedBy   = "tfpilot"
+      Project     = "payments"
+      Environment = "dev"
     }
   }
 }

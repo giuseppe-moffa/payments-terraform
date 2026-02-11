@@ -3,6 +3,86 @@ name: Terraform Apply
 on:
   workflow_dispatch:
     inputs:
+      request_id:
+        description: "Request ID (optional)"
+        required: false
+        type: string
+      environment:
+        description: "Environment (dev or prod)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+concurrency:
+  group: payments-terraform-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: envs/${{ env.ENVIRONMENT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::420259807324:role/tfplan-connector
+          aws-region: eu-west-2
+          role-session-name: tfplan-apply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Debug AWS identity and context
+        run: |
+          set -euxo pipefail
+          aws sts get-caller-identity
+          aws configure get region || true
+          echo "TF_WORKING_DIR=$(pwd)"
+          terraform version
+          pwd
+          ls -la
+
+      - name: Terraform Init
+        run: |
+          set -euxo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=tfpilot-tfstate-core-${{ env.ENVIRONMENT }}" \
+            -backend-config="key=tfpilot-tfstate-core-${{ env.ENVIRONMENT }}/envs/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+            -backend-config="region=eu-west-2" \
+            -backend-config="dynamodb_table=tfpilot-tfstate-lock-core-${{ env.ENVIRONMENT }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Apply
+        run: |
+          set -euxo pipefail
+          terraform apply -input=false -auto-approve -lock-timeout=300s | tee apply.txt
+
+      - name: Upload apply logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-logs
+          path: |
+            apply.txt
+            envs/${{ inputs.environment }}/.terraform.lock.hcl
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
       environment:
         description: "Environment to apply (dev|prod)"
         required: true

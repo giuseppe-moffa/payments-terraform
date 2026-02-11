@@ -9,13 +9,19 @@ locals {
   bucket_name = coalesce(var.bucket_name, substr(replace(local.base_bucket_name, "/[^a-z0-9-]/", ""), 0, 63))
 
   required_tags = {
-    ManagedBy         = "tfpilot"
-    TfPilotRequestId  = var.request_id
-    Project           = var.project
-    Environment       = var.environment
+    ManagedBy        = "tfpilot"
+    TfPilotRequestId = var.request_id
+    Project          = var.project
+    Environment      = var.environment
   }
 
-  merged_tags = merge(local.required_tags, var.tags)
+  sanitized_tags = {
+    for k, v in var.tags :
+    k => v
+    if !contains(["managedby", "tfpilotrequestid", "project", "environment"], lower(k))
+  }
+
+  merged_tags = merge(local.sanitized_tags, local.required_tags)
 }
 
 resource "aws_s3_bucket" "this" {
@@ -86,4 +92,86 @@ data "aws_iam_policy_document" "deny_insecure_transport" {
 resource "aws_s3_bucket_policy" "deny_insecure" {
   bucket = aws_s3_bucket.this.id
   policy = data.aws_iam_policy_document.deny_insecure_transport.json
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "default" {
+  bucket = aws_s3_bucket.this.id
+
+  rule {
+    id     = "default-lifecycle"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.noncurrent_expiration_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = var.abort_multipart_days
+    }
+  }
+}
+
+variable "name" {
+  type        = string
+  description = "Logical name for the bucket (used if bucket_name not provided)"
+}
+
+variable "project" {
+  type        = string
+  description = "Project identifier"
+}
+
+variable "environment" {
+  type        = string
+  description = "Environment identifier (e.g., dev, prod)"
+}
+
+variable "request_id" {
+  type        = string
+  description = "Optional request identifier to add uniqueness"
+  default     = ""
+}
+
+variable "bucket_name" {
+  type        = string
+  description = "Override for bucket name; set null to derive"
+  default     = null
+}
+
+variable "versioning_enabled" {
+  type        = bool
+  description = "Enable S3 versioning"
+  default     = true
+}
+
+variable "force_destroy" {
+  type        = bool
+  description = "Allow force destroy of bucket"
+  default     = false
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS key ARN for bucket encryption; null for SSE-S3"
+  default     = null
+}
+
+variable "noncurrent_expiration_days" {
+  type        = number
+  description = "Days before expiring noncurrent versions"
+  default     = 30
+}
+
+variable "abort_multipart_days" {
+  type        = number
+  description = "Days before aborting incomplete multipart uploads"
+  default     = 7
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Additional tags to merge with required defaults"
+  default     = {}
 }
