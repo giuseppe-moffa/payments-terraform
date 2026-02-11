@@ -3,6 +3,19 @@ name: Terraform Plan
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      request_id:
+        description: "Request ID (optional)"
+        required: false
+        type: string
+      environment:
+        description: "Environment (dev or prod)"
+        required: false
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
 
 permissions:
   id-token: write
@@ -11,12 +24,11 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    concurrency:
-      group: terraform-plan-${{ github.ref }}-${{ matrix.env }}
-      cancel-in-progress: true
-    strategy:
-      matrix:
-        env: [dev, prod]
+    env:
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: envs/${{ env.ENVIRONMENT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,20 +36,19 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          role-to-assume: arn:aws:iam::123456789012:role/tfpilot-connector
-          role-session-name: tfpilot-plan
+          role-to-assume: arn:aws:iam::420259807324:role/tfplan-connector
           aws-region: eu-west-2
+          role-session-name: tfplan-plan
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform fmt
-        run: terraform fmt -check
-
-      - name: Terraform init
-        working-directory: envs/${{ matrix.env }}
+      - name: Terraform Init
         run: terraform init -input=false
 
-      - name: Terraform plan
-        working-directory: envs/${{ matrix.env }}
-        run: terraform plan -input=false -no-color
+      - name: Terraform Plan
+        run: terraform plan -input=false -no-color | tee plan.out
+
+      - name: Upload plan summary
+        if: always()
+        run: cat plan.out
