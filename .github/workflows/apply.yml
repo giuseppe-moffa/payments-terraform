@@ -1,0 +1,51 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply (dev|prod)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: terraform-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/tfpilot-connector
+          role-session-name: tfpilot-apply
+          aws-region: eu-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: envs/${{ inputs.environment }}
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: envs/${{ inputs.environment }}
+        run: |
+          echo "Repo: ${{ github.repository }}"
+          echo "Env: ${{ inputs.environment }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Request ID: ${{ inputs.request_id || 'n/a' }}"
+          terraform apply -input=false -auto-approve
