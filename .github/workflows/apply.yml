@@ -16,7 +16,7 @@ on:
           - prod
 
 concurrency:
-  group: payments-terraform-${{ inputs.environment || 'dev' }}
+  group: payments-terraform-${{ inputs.environment || 'dev' }}-${{ inputs.request_id || 'global' }}
   cancel-in-progress: true
 
 permissions:
@@ -26,6 +26,7 @@ permissions:
 jobs:
   apply:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'nonprod' }}
     env:
       ENVIRONMENT: ${{ inputs.environment || 'dev' }}
     defaults:

@@ -1,0 +1,160 @@
+name: Terraform Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "TfPilot request ID"
+        required: true
+      environment:
+        description: "Target environment"
+        required: true
+      target_base:
+        description: "Base branch"
+        required: false
+        default: "main"
+      cleanup_paths:
+        description: "Comma-separated paths to remove"
+        required: false
+        default: ""
+      target_env_path:
+        description: "Environment path (informational)"
+        required: false
+        default: ""
+      auto_merge:
+        description: "Auto-merge when not prod"
+        required: false
+        default: "false"
+      ref:
+        description: "Git ref (commit/branch) to checkout (defaults to target_base)"
+        required: false
+        default: ""
+      dry_run:
+        description: "If true, skip pushing/PR creation (plan only)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: payments-terraform-${{ inputs.environment || 'dev' }}-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'nonprod' }}
+    env:
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || inputs.target_base }}
+
+      - name: Configure git
+        run: |
+          git config user.name "tfpilot-bot"
+          git config user.email "tfpilot-bot@users.noreply.github.com"
+
+      - name: Normalize cleanup paths
+        id: paths
+        run: |
+          echo "${{ inputs.cleanup_paths }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' > paths.txt
+          count=$(wc -l < paths.txt || true)
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Remove tfpilot blocks
+        run: |
+          if [ ! -s paths.txt ]; then
+            echo "No cleanup paths provided; skipping removal"
+            exit 0
+          fi
+          python <<'PY'
+          import pathlib, os
+
+          req_id = os.environ.get("REQ", "")
+          marker_start = f"# --- tfpilot:begin:{req_id} ---"
+          marker_end = f"# --- tfpilot:end:{req_id} ---"
+
+          paths = [p.strip() for p in pathlib.Path("paths.txt").read_text().splitlines() if p.strip()]
+
+          for p in paths:
+              path = pathlib.Path(p)
+              if not path.exists():
+                  print(f"Path not found, skipping: {p}")
+                  continue
+              if path.suffix == ".tf":
+                  text = path.read_text()
+                  start = text.find(marker_start)
+                  end = text.find(marker_end)
+                  if start != -1 and end != -1:
+                      end_line = text.find("\n", end)
+                      if end_line == -1:
+                          end_line = len(text)
+                      new_text = text[:start] + text[end_line + 1 :]
+                      if new_text.strip():
+                          path.write_text(new_text)
+                          print(f"Removed tfpilot block for {req_id} from {p}")
+                      else:
+                          path.write_text("\n")
+                          print(f"Block removed; {p} left as empty file")
+                  else:
+                      print(f"Markers not found in {p}, leaving file untouched")
+              else:
+                  print(f"Skipping non-TF path {p}; no removal performed")
+          PY
+        env:
+          REQ: ${{ inputs.request_id }}
+
+      - name: Create branch and commit
+        id: commit
+        run: |
+          BR="cleanup/${{ inputs.request_id }}"
+          git fetch origin "$BR" || true
+          if git ls-remote --exit-code origin "$BR" >/dev/null 2>&1; then
+            git checkout -B "$BR" "origin/$BR"
+          else
+            git checkout -B "$BR" "${{ inputs.target_base }}"
+          fi
+          git status --short
+          if git status --short | grep . >/dev/null 2>&1; then
+            git add -A
+          else
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git commit -m "Cleanup request ${{ inputs.request_id }}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Dry run: skipping push/PR"
+            exit 0
+          fi
+          git push origin "$BR"
+          echo "branch=$BR" >> $GITHUB_OUTPUT
+
+      - name: Create PR
+        id: pr
+        if: steps.commit.outputs.no_changes != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BR="${{ steps.commit.outputs.branch }}"
+          pr_info=$(gh pr create \
+            --base "${{ inputs.target_base }}" \
+            --head "$BR" \
+            --title "Cleanup request ${{ inputs.request_id }}" \
+            --body "Automated cleanup for request ${{ inputs.request_id }} in environment '${{ inputs.environment }}'.")
+          pr_url=$(gh pr view "$BR" --json url --jq .url)
+          pr_number=$(gh pr view "$BR" --json number --jq .number)
+          echo "url=$pr_url" >> $GITHUB_OUTPUT
+          echo "number=$pr_number" >> $GITHUB_OUTPUT
+          echo "$pr_info"
+
+      - name: Enable auto-merge (non-prod)
+        if: inputs.auto_merge == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.pr.outputs.number }}" --merge --auto

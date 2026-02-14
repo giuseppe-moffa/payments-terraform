@@ -14,10 +14,18 @@ on:
         options:
           - dev
           - prod
+      ref:
+        description: "Git ref (commit/branch) to checkout (defaults to base)"
+        required: false
+        default: ""
+      dry_run:
+        description: "If true, skip terraform destroy (for testing)"
+        required: false
+        default: "false"
 
 concurrency:
-  group: payments-terraform-destroy-${{ inputs.environment || 'dev' }}
-  cancel-in-progress: true
+  group: payments-terraform-${{ inputs.environment || 'dev' }}-${{ inputs.request_id }}
+  cancel-in-progress: false
 
 permissions:
   id-token: write
@@ -26,14 +34,18 @@ permissions:
 jobs:
   destroy:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'nonprod' }}
     env:
       ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
     defaults:
       run:
         working-directory: envs/${{ env.ENVIRONMENT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v2
@@ -66,6 +78,10 @@ jobs:
       - name: Terraform Destroy (target module)
         run: |
           set -euxo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Dry run enabled; skipping destroy"
+            exit 0
+          fi
           terraform destroy -input=false -auto-approve -lock-timeout=300s -target="module.tfpilot_${{ inputs.request_id }}"
 
       - name: Upload destroy logs
