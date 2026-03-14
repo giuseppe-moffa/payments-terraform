@@ -1,13 +1,9 @@
 # Model 2: envs/<workspace_key>/<workspace_slug>. Supports deploy/<key>/<slug> branches (ENV_ROOT).
-name: Terraform Apply (v2)
+name: Drift Plan (v2)
 
 on:
   workflow_dispatch:
     inputs:
-      request_id:
-        description: "Request ID (optional)"
-        required: false
-        type: string
       workspace_key:
         description: "Workspace key (dev or prod)"
         required: true
@@ -29,7 +25,7 @@ permissions:
   contents: read
 
 jobs:
-  apply:
+  drift-plan:
     runs-on: ubuntu-latest
     environment: ${{ inputs.workspace_key == 'prod' && 'production' || 'nonprod' }}
     env:
@@ -40,26 +36,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::420259807324:role/tfplan-connector
           aws-region: eu-west-2
-          role-session-name: tfplan-apply-v2
+          role-session-name: tfplan-drift-v2
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
-      - name: Debug AWS identity and context
-        run: |
-          set -euxo pipefail
-          aws sts get-caller-identity
-          aws configure get region || true
-          echo "TF_WORKING_DIR=$(pwd)"
-          terraform version
-          pwd
-          ls -la
 
       - name: Terraform Init
         run: |
@@ -71,22 +59,37 @@ jobs:
             -backend-config="dynamodb_table=tfpilot-tfstate-lock-payments-${{ inputs.workspace_key }}" \
             -backend-config="encrypt=true"
 
-      - name: Terraform Apply
+      - name: Terraform Plan (Drift Detection)
+        id: plan
+        continue-on-error: true
         run: |
-          set -euxo pipefail
-          REQUEST_ID="${{ inputs.request_id }}"
-          TARGET_ARG=""
-          if [ -n "$REQUEST_ID" ]; then
-            MODULE_NAME="tfpilot_$(echo "$REQUEST_ID" | sed 's/[^a-zA-Z0-9_]/_/g')"
-            TARGET_ARG="-target=module.${MODULE_NAME}"
-          fi
-          terraform apply -input=false -auto-approve -lock-timeout=300s $TARGET_ARG | tee apply.txt
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode -out=plan.out | tee plan.txt
+          PLAN_EXIT=$?
+          echo "plan_exit_code=$PLAN_EXIT" >> $GITHUB_OUTPUT
+          set -e
 
-      - name: Upload apply logs
+      - name: Export plan JSON
+        if: always()
+        run: |
+          if [ -f plan.out ]; then
+            terraform show -no-color -json plan.out > plan.json
+          else
+            echo '{"planned_values":{}}' > plan.json
+          fi
+
+      - name: Upload drift logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apply-logs-v2
+          name: drift-logs-v2
           path: |
-            ${{ env.ENV_ROOT }}/apply.txt
+            ${{ env.ENV_ROOT }}/plan.txt
             ${{ env.ENV_ROOT }}/.terraform.lock.hcl
+
+      - name: Upload drift plan JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-plan-json-v2
+          path: ${{ env.ENV_ROOT }}/plan.json

@@ -1,46 +1,112 @@
-name: Terraform Plan
+# Model 2: envs/<workspace_key>/<workspace_slug>. Supports deploy/<key>/<slug> and request/<id> branches.
+name: Terraform Plan (v2)
 
 on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: "Request ID (optional)"
+        description: "TfPilot request ID (optional; empty = full workspace plan for deploy branches)"
         required: false
         type: string
-      environment:
-        description: "Environment (dev or prod)"
+      workspace_key:
+        description: "Workspace key (dev or prod)"
         required: true
         type: choice
         options:
           - dev
           - prod
+      workspace_slug:
+        description: "Workspace slug (e.g. ai-agent)"
+        required: true
+        type: string
+  pull_request:
+    branches: [main]
 
 concurrency:
-  group: payments-terraform-${{ inputs.environment || 'dev' }}-${{ inputs.request_id || 'global' }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'workflow_dispatch' && format('payments-terraform-{0}-{1}-{2}', inputs.workspace_key, inputs.workspace_slug, inputs.request_id || 'deploy') || format('payments-terraform-pr-{0}', github.head_ref) }}
+  cancel-in-progress: false
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
+  resolve-env:
+    runs-on: ubuntu-latest
+    outputs:
+      workspace_key: ${{ steps.out.outputs.workspace_key }}
+      workspace_slug: ${{ steps.out.outputs.workspace_slug }}
+      request_id: ${{ steps.out.outputs.request_id }}
+      skip: ${{ steps.out.outputs.skip }}
+    steps:
+      - name: Checkout (for PR workspace resolution)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 500
+
+      - name: Resolve workspace
+        id: out
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "workspace_key=${{ inputs.workspace_key }}" >> $GITHUB_OUTPUT
+            echo "workspace_slug=${{ inputs.workspace_slug }}" >> $GITHUB_OUTPUT
+            echo "request_id=${{ inputs.request_id || '' }}" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            REF="${{ github.head_ref }}"
+            if [[ "$REF" =~ ^deploy/([^/]+)/(.+)$ ]]; then
+              echo "workspace_key=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+              echo "workspace_slug=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+              echo "request_id=" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            elif [[ "$REF" =~ ^request/(.+)$ ]]; then
+              echo "request_id=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+              git fetch origin ${{ github.base_ref }} --depth=500 2>/dev/null || true
+              FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null || true)
+              ENV_ROOTS=$(echo "$FILES" | grep -oE '^envs/([^/]+)/([^/]+)/' | sort -u)
+              ENV_COUNT=$(echo "$ENV_ROOTS" | grep -c . || echo 0)
+              if [ "$ENV_COUNT" -gt 1 ]; then
+                echo "::error::PR changes multiple workspace roots (found $ENV_COUNT); expect exactly one workspace per request branch"
+                exit 1
+              fi
+              if [ -z "$ENV_ROOTS" ]; then
+                echo "::error::Could not determine workspace from PR changed files (expect envs/<key>/<slug>/ in path)"
+                exit 1
+              fi
+              ENV_LINE=$(echo "$ENV_ROOTS" | head -1)
+              KEY=$(echo "$ENV_LINE" | cut -d/ -f2)
+              SLUG=$(echo "$ENV_LINE" | cut -d/ -f3)
+              echo "workspace_key=$KEY" >> $GITHUB_OUTPUT
+              echo "workspace_slug=$SLUG" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "workspace_key=" >> $GITHUB_OUTPUT
+              echo "workspace_slug=" >> $GITHUB_OUTPUT
+              echo "request_id=" >> $GITHUB_OUTPUT
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
   plan:
+    needs: resolve-env
+    if: needs.resolve-env.outputs.skip != 'true'
     runs-on: ubuntu-latest
     env:
-      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      ENV_ROOT: envs/${{ needs.resolve-env.outputs.workspace_key }}/${{ needs.resolve-env.outputs.workspace_slug }}
     defaults:
       run:
-        working-directory: envs/${{ env.ENVIRONMENT }}
+        working-directory: ${{ env.ENV_ROOT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::420259807324:role/tfplan-connector
           aws-region: eu-west-2
-          role-session-name: tfplan-plan
+          role-session-name: tfplan-plan-v2
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -59,22 +125,172 @@ jobs:
         run: |
           set -euxo pipefail
           terraform init -input=false \
-            -backend-config="bucket=tfpilot-tfstate-payments-${{ env.ENVIRONMENT }}" \
-            -backend-config="key=tfpilot-tfstate-payments-${{ env.ENVIRONMENT }}/envs/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+            -backend-config="bucket=tfpilot-tfstate-payments-${{ needs.resolve-env.outputs.workspace_key }}" \
+            -backend-config="key=${{ needs.resolve-env.outputs.workspace_slug }}/terraform.tfstate" \
             -backend-config="region=eu-west-2" \
-            -backend-config="dynamodb_table=tfpilot-tfstate-lock-payments-${{ env.ENVIRONMENT }}" \
+            -backend-config="dynamodb_table=tfpilot-tfstate-lock-payments-${{ needs.resolve-env.outputs.workspace_key }}" \
             -backend-config="encrypt=true"
 
       - name: Terraform Plan
         run: |
           set -euxo pipefail
-          terraform plan -input=false -no-color -lock-timeout=300s | tee plan.txt
+          REQUEST_ID="${{ needs.resolve-env.outputs.request_id }}"
+          TARGET_ARG=""
+          if [ -n "$REQUEST_ID" ]; then
+            MODULE_NAME="tfpilot_$(echo "$REQUEST_ID" | sed 's/[^a-zA-Z0-9_]/_/g')"
+            TARGET_ARG="-target=module.${MODULE_NAME}"
+          fi
+          PLAN_TXT="${GITHUB_WORKSPACE}/${{ env.ENV_ROOT }}/plan.txt"
+          PLAN_JSON="${GITHUB_WORKSPACE}/${{ env.ENV_ROOT }}/plan.json"
+          terraform plan -input=false -no-color -lock=false $TARGET_ARG -out=tfplan.binary | tee "$PLAN_TXT"
+          terraform show -json tfplan.binary > "$PLAN_JSON"
 
       - name: Upload plan logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: plan-logs
+          name: plan-logs-v2
           path: |
-            plan.txt
-            envs/${{ inputs.environment }}/.terraform.lock.hcl
+            ${{ env.ENV_ROOT }}/plan.txt
+            ${{ env.ENV_ROOT }}/plan.json
+            ${{ env.ENV_ROOT }}/.terraform.lock.hcl
+
+  infracost:
+    name: Infracost cost estimation
+    runs-on: ubuntu-latest
+    needs: [resolve-env, plan]
+    if: needs.resolve-env.outputs.skip != 'true' && needs.plan.result == 'success'
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    env:
+      ENV_ROOT: envs/${{ needs.resolve-env.outputs.workspace_key }}/${{ needs.resolve-env.outputs.workspace_slug }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Terraform file changes
+        id: tf-changes
+        run: |
+          git fetch origin main --depth=500 2>/dev/null || git fetch origin master --depth=500 2>/dev/null || true
+          BASE=origin/main
+          git show-ref -q refs/remotes/origin/main || BASE=origin/master
+          set +e
+          OUT=$(git diff --name-only $BASE...HEAD -- '**/*.tf' '**/*.tfvars' '**/*.tfvars.json' 2>/dev/null)
+          DIFF_EXIT=$?
+          if [ $DIFF_EXIT -ne 0 ]; then
+            git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+            OUT=$(git diff --name-only $BASE...HEAD -- '**/*.tf' '**/*.tfvars' '**/*.tfvars.json' 2>/dev/null)
+            DIFF_EXIT=$?
+          fi
+          set -e
+          if [ $DIFF_EXIT -ne 0 ] || echo "$OUT" | grep -q .; then
+            echo "has_tf_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tf_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Infracost
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Download plan artifact
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-logs-v2
+
+      - name: Ensure plan.json at ENV_ROOT
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        run: |
+          PLAN_JSON="${{ env.ENV_ROOT }}/plan.json"
+          if [ -f "$PLAN_JSON" ]; then
+            echo "plan.json already at $PLAN_JSON"
+          elif [ -f plan.json ]; then
+            mkdir -p "${{ env.ENV_ROOT }}"
+            cp plan.json "$PLAN_JSON"
+            echo "Copied plan.json from ./ to $PLAN_JSON"
+          else
+            echo "::error::plan.json not found"
+            find . -name "plan.json" 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Generate Infracost cost JSON
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        run: |
+          PLAN_JSON="${{ env.ENV_ROOT }}/plan.json"
+          if [ -f "$PLAN_JSON" ]; then
+            infracost breakdown --path="$PLAN_JSON" --format=json --out-file=infracost-cost.json
+          else
+            echo "::warning::Plan JSON not found at $PLAN_JSON"
+            find . -name "plan.json" 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Generate Infracost diff JSON
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        run: |
+          PLAN_JSON="${{ env.ENV_ROOT }}/plan.json"
+          infracost diff --path="$PLAN_JSON" --format=json --out-file=infracost-diff.json
+
+      - name: Upload Infracost artifacts
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-cost.json
+          path: infracost-cost.json
+
+      - name: Upload Infracost diff artifact
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-diff.json
+          path: infracost-diff.json
+
+      - name: Configure AWS credentials (for S3 upload)
+        if: steps.tf-changes.outputs.has_tf_changes == 'true' && needs.resolve-env.outputs.request_id != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420259807324:role/tfplan-connector
+          aws-region: eu-west-2
+          role-session-name: tfplan-infracost-s3
+
+      - name: Upload Infracost results to S3
+        if: steps.tf-changes.outputs.has_tf_changes == 'true' && needs.resolve-env.outputs.request_id != ''
+        env:
+          REQUEST_ID: ${{ needs.resolve-env.outputs.request_id }}
+          REQUESTS_BUCKET: ${{ vars.TFPILOT_REQUESTS_BUCKET || 'tfpilot-requests' }}
+        run: |
+          if [ -z "$REQUEST_ID" ]; then exit 0; fi
+          if [ ! -f infracost-cost.json ] || [ ! -f infracost-diff.json ]; then
+            echo "Infracost JSON files not found, skipping S3 upload"
+            exit 0
+          fi
+          aws s3 cp infracost-cost.json "s3://${REQUESTS_BUCKET}/cost/${REQUEST_ID}/infracost-cost.json" --content-type "application/json"
+          aws s3 cp infracost-diff.json "s3://${REQUESTS_BUCKET}/cost/${REQUEST_ID}/infracost-diff.json" --content-type "application/json"
+          echo "Uploaded cost artifacts to s3://${REQUESTS_BUCKET}/cost/${REQUEST_ID}/"
+
+      - name: Get PR number
+        if: steps.tf-changes.outputs.has_tf_changes == 'true'
+        id: pr
+        run: |
+          PR_NUM=$(gh pr list --head "${{ github.head_ref || github.ref_name }}" --state open --json number -q '.[0].number' 2>/dev/null || echo "")
+          echo "number=${PR_NUM}" >> $GITHUB_OUTPUT
+          echo "PR number: ${PR_NUM}"
+
+      - name: Post Infracost PR comment
+        if: steps.tf-changes.outputs.has_tf_changes == 'true' && steps.pr.outputs.number != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          infracost comment github --path=infracost-diff.json \
+            --repo=${{ github.repository }} \
+            --github-token="$GITHUB_TOKEN" \
+            --pull-request=${{ steps.pr.outputs.number }} \
+            --behavior=update

@@ -1,9 +1,4 @@
+# Backend config injected by workflows via -backend-config (bucket, key, region, dynamodb_table, encrypt)
 terraform {
-  backend "s3" {
-    bucket         = "tfpilot-tfstate-payments-dev"
-    key            = "envs/dev/terraform.tfstate"
-    region         = "eu-west-2"
-    dynamodb_table = "tfpilot-tfstate-lock-payments-dev"
-    encrypt        = true
-  }
+  backend "s3" {}
 }

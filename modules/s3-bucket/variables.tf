@@ -1,6 +1,6 @@
 variable "name" {
   type        = string
-  description = "Logical name for the bucket (used if bucket_name not provided)"
+  description = "Full bucket name (e.g. project-environment-userName-shortId from TfPilot); only sanitized for S3 length/chars"
 }
 
 variable "project" {
@@ -17,12 +17,6 @@ variable "request_id" {
   type        = string
   description = "Optional request identifier to add uniqueness"
   default     = ""
-}
-
-variable "bucket_name" {
-  type        = string
-  description = "Override for bucket name; set null to derive"
-  default     = null
 }
 
 variable "versioning_enabled" {

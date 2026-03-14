@@ -1,12 +1,5 @@
+# name from TfPilot is the full resource name (project-env-userName-shortId); use as-is, only sanitize for S3
 locals {
-  base_bucket_name = lower(join("-", compact([
-    var.project,
-    var.environment,
-    var.name,
-  ])))
-
-  bucket_name = coalesce(var.bucket_name, substr(replace(local.base_bucket_name, "/[^a-z0-9-]/", ""), 0, 63))
-
   required_tags = {
     ManagedBy        = "tfpilot"
     TfPilotRequestId = var.request_id
@@ -24,7 +17,7 @@ locals {
 }
 
 resource "aws_s3_bucket" "this" {
-  bucket        = local.bucket_name
+  bucket        = substr(replace(lower(var.name), "/[^a-z0-9-]/", "-"), 0, 63)
   force_destroy = var.force_destroy
 
   tags = local.merged_tags

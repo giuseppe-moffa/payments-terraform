@@ -18,8 +18,11 @@ Each environment is a separate Terraform root (`envs/dev`, `envs/prod`). Files:
 - `tfpilot.<type>.tf` — TfPilot-managed files per resource type (ecs/s3/sqs/misc); do not edit by hand.
 
 ## Workflows
-- `plan.yml`: triggers on PR and workflow_dispatch; runs fmt, init, and plan for both envs.
-- `apply.yml`: workflow_dispatch only; input `environment` (dev|prod); runs init+apply in that env. No auto-apply on push/PR.
+
+See [.github/workflows/README.md](.github/workflows/README.md) for a full description of all workflows (Plan, Apply, Destroy, Cleanup, Drift Check, Drift Plan), how they are triggered, and how concurrency works.
+
+- `plan.yml`: workflow_dispatch (TfPilot); runs init + plan for the request's module.
+- `apply.yml`: workflow_dispatch; input `environment` (dev|prod), optional `request_id`; runs init+apply. No auto-apply on push/PR.
 
 ## Usage
 1) Bootstrap (once per account/env): create S3 buckets `tfstate-payments-dev` / `tfstate-payments-prod` (versioning+encryption+block public) and DynamoDB tables `tfstate-lock-payments-dev` / `tfstate-lock-payments-prod` with partition key `LockID` (string).
